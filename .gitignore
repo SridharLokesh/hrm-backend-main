@@ -1,0 +1,63 @@
+# === Node.js ===
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# === Logs ===
+logs
+*.log
+log.txt
+debug.log
+error.log
+
+# === Build output ===
+dist/
+build/
+.cache/
+.next/
+out/
+
+# === OS files ===
+.DS_Store
+Thumbs.db
+
+# === IDE/Editor ===
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# === Coverage / Reports ===
+coverage/
+*.lcov
+
+# === Temporary files ===
+tmp/
+temp/
+*.tmp
+*.bak
+
+# === Local Database / Uploads (optional) ===
+/uploads/
+mongodb-data/
+
+# === React Specific ===
+# For Vite or CRA
+*.tsbuildinfo
+
+# === Environment Files ===
+.env*
+!.env.example
+
+# === Package lock files (optional if using only one manager) ===
+# Uncomment only the ones not used
+# package-lock.json
+# yarn.lock
+# pnpm-lock.yaml
