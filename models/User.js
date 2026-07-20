@@ -68,13 +68,29 @@ role: {
 });
 
 // Encrypt password before saving
+//
+// ✅ FIX: this hook previously called next() ONLY on the "password not
+// modified" branch, and never called next() at all after hashing the
+// password on the "password modified" branch (i.e. on every brand-new
+// User, since a new document always counts as modified). Mongoose waits
+// for that callback to know the hook is done — without it, the save
+// never signals completion, so User.create()/user.save() can hang
+// indefinitely on creation. On top of that, the missing `return` meant
+// that even the "not modified" branch fell through and re-hashed an
+// already-hashed password on every unrelated save (e.g. a role-only
+// update), silently corrupting it.
+//
+// This restores the standard, correct pattern: return early (with
+// next()) when password wasn't touched, otherwise hash it and then
+// call next() exactly once.
 userSchema.pre('save', async function(next) {
   if (!this.isModified('password')) {
-    next();
+    return next();
   }
-  
+
   const salt = await bcrypt.genSalt(10);
   this.password = await bcrypt.hash(this.password, salt);
+  next();
 });
 
 // Update passwordChangedAt when password is modified
@@ -107,14 +123,14 @@ userSchema.methods.changedPasswordAfter = function(JWTTimestamp) {
 userSchema.methods.createPasswordResetToken = function() {
   const crypto = require('crypto');
   const resetToken = crypto.randomBytes(32).toString('hex');
-  
+
   this.passwordResetToken = crypto
     .createHash('sha256')
     .update(resetToken)
     .digest('hex');
-    
+
   this.passwordResetExpires = Date.now() + 10 * 60 * 1000; // 10 minutes
-  
+
   return resetToken;
 };
 
@@ -122,7 +138,7 @@ userSchema.methods.createPasswordResetToken = function() {
 userSchema.methods.createLoginSession = function(token) {
   const jwt = require('jsonwebtoken');
   const decoded = jwt.verify(token, process.env.JWT_SECRET);
-  
+
   this.loginSession = {
     token: token,
     expires: new Date(decoded.exp * 1000), // Convert to milliseconds
@@ -141,15 +157,15 @@ userSchema.methods.isSessionValid = function(token) {
   if (!this.loginSession || !this.loginSession.isValid) {
     return false;
   }
-  
+
   if (this.loginSession.token !== token) {
     return false;
   }
-  
+
   if (this.loginSession.expires < new Date()) {
     return false;
   }
-  
+
   return true;
 };
 

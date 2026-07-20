@@ -1,10 +1,10 @@
-//attendencecontroller.js
 const Attendance = require('../models/Attendance');
 const Employee = require('../models/Employee');
 const moment = require('moment');
 const reverseGeocode = require('../utils/reverseGeocode');
 const Shift = require('../models/Shift');
 const mongoose = require('mongoose');
+const { emitToUserClients } = require('./notificationController');
 
 const getEmployeeIdFromRequest = (req) => req.user?.employee?._id || req.user?.employee;
 
@@ -675,6 +675,40 @@ exports.updateAttendanceTime = async (req, res) => {
         }
       );
     }
+
+    // If admin marked this record as absent, notify the employee via socket
+    if (requestedStatus === 'absent') {
+      try {
+        const { User: UserModel, Notification: NotificationModel } = req.models;
+        if (UserModel && NotificationModel) {
+          const empId = employee._id || employee;
+          const tenantId = req.tenant._id;
+          const employeeUser = await UserModel.findOne({
+            employee: empId,
+            tenant: tenantId,
+            isActive: true
+          }).select('_id');
+
+          if (employeeUser) {
+            const notification = await NotificationModel.create({
+              user:          employeeUser._id,
+              employee:      empId,
+              tenant:        tenantId,
+              type:          'absent',
+              title:         'Marked absent by admin',
+              message:       `Your attendance for ${moment(newAttendanceDate).format('MMM D, YYYY')} has been marked absent by an admin.`,
+              relatedEntity: 'attendance',
+              entityId:      attendance._id,
+              isRead:        false
+            });
+            emitToUserClients(employeeUser._id.toString(), notification);
+          }
+        }
+      } catch (notifyErr) {
+        console.error('[updateAttendanceTime] Absent notify failed:', notifyErr.message);
+      }
+    }
+
     await attendance.populate('employee', 'name email department position');
     await attendance.populate('shift', 'name displayName startTime endTime isNightShift');
 
@@ -812,6 +846,8 @@ exports.createAdminAttendanceEntry = async (req, res) => {
       ? 0
       : (newCheckOut ? calculateWorkingHours({ checkIn: newCheckIn, checkOut: newCheckOut }) : 0);
 
+    let savedAttendance;
+
     if (duplicateAttendance) {
       const updatedWorkingHours = await applyAttendanceEditValues({
         attendance: duplicateAttendance,
@@ -841,10 +877,43 @@ exports.createAdminAttendanceEntry = async (req, res) => {
       duplicateAttendance.workingHours = updatedWorkingHours;
       duplicateAttendance.adjustedHours = updatedWorkingHours;
 
+      savedAttendance = duplicateAttendance;
+
       await duplicateAttendance.populate('employee', 'name email department position');
       await duplicateAttendance.populate('shift', 'name displayName startTime endTime isNightShift');
 
       const [populated] = await populateLocations([duplicateAttendance], req.models);
+
+      // Notify if admin-marked absent
+      if (requestedStatus === 'absent') {
+        try {
+          const { User: UserModel, Notification: NotificationModel } = req.models;
+          if (UserModel && NotificationModel) {
+            const empUser = await UserModel.findOne({
+              employee: employeeId,
+              tenant: req.tenant._id,
+              isActive: true
+            }).select('_id');
+            if (empUser) {
+              const notification = await NotificationModel.create({
+                user:          empUser._id,
+                employee:      employeeId,
+                tenant:        req.tenant._id,
+                type:          'absent',
+                title:         'Marked absent by admin',
+                message:       `Your attendance for ${moment(attendanceDate).format('MMM D, YYYY')} has been marked absent by an admin.`,
+                relatedEntity: 'attendance',
+                entityId:      duplicateAttendance._id,
+                isRead:        false
+              });
+              emitToUserClients(empUser._id.toString(), notification);
+            }
+          }
+        } catch (notifyErr) {
+          console.error('[createAdminAttendanceEntry] Absent notify failed:', notifyErr.message);
+        }
+      }
+
       return res.json(populated || duplicateAttendance);
     }
 
@@ -895,6 +964,36 @@ exports.createAdminAttendanceEntry = async (req, res) => {
       attendance.status = requestedStatus;
       attendance.workingHours = workingHours;
       attendance.adjustedHours = workingHours;
+    }
+
+    // Notify if admin-marked absent
+    if (requestedStatus === 'absent') {
+      try {
+        const { User: UserModel, Notification: NotificationModel } = req.models;
+        if (UserModel && NotificationModel) {
+          const empUser = await UserModel.findOne({
+            employee: employeeId,
+            tenant: req.tenant._id,
+            isActive: true
+          }).select('_id');
+          if (empUser) {
+            const notification = await NotificationModel.create({
+              user:          empUser._id,
+              employee:      employeeId,
+              tenant:        req.tenant._id,
+              type:          'absent',
+              title:         'Marked absent by admin',
+              message:       `Your attendance for ${moment(attendanceDate).format('MMM D, YYYY')} has been marked absent by an admin.`,
+              relatedEntity: 'attendance',
+              entityId:      attendance._id,
+              isRead:        false
+            });
+            emitToUserClients(empUser._id.toString(), notification);
+          }
+        }
+      } catch (notifyErr) {
+        console.error('[createAdminAttendanceEntry] Absent notify failed:', notifyErr.message);
+      }
     }
 
     await attendance.populate('employee', 'name email department position');
@@ -1122,6 +1221,50 @@ exports.getTodayShiftsStatus = async (req, res) => {
 };
 
 // =============================================================================
+// ABSENT NOTIFICATION HELPER
+// Used by both cron jobs below to create a DB notification and emit via socket.
+// =============================================================================
+const _notifyAbsent = async ({ tenantId, employeeId, reason, User, Notification }) => {
+  try {
+    if (!User || !Notification || !tenantId || !employeeId) return;
+
+    const user = await User.findOne({
+      employee: employeeId,
+      tenant: tenantId,
+      isActive: true
+    }).select('_id');
+
+    if (!user) return;
+
+    const titles = {
+      'no-checkin':          'Absent — no check-in recorded',
+      'not-checked-out-24h': 'Absent — session left open',
+      'admin-marked':        'Marked absent by admin',
+    };
+    const messages = {
+      'no-checkin':          'You were marked absent today because no check-in was recorded.',
+      'not-checked-out-24h': 'Your check-in session was open for over 24 hours and has been closed as absent.',
+      'admin-marked':        'Your attendance for today has been marked absent by an admin.',
+    };
+
+    const notification = await Notification.create({
+      user:          user._id,
+      employee:      employeeId,
+      tenant:        tenantId,
+      type:          'absent',
+      title:         titles[reason] || 'Absent',
+      message:       messages[reason] || 'You have been marked absent.',
+      relatedEntity: 'attendance',
+      isRead:        false
+    });
+
+    emitToUserClients(user._id.toString(), notification);
+  } catch (err) {
+    console.error('[AbsentNotify] Failed to notify employee', employeeId, ':', err.message);
+  }
+};
+
+// =============================================================================
 // AUTO-ABSENT CRON JOB
 // Runs every day at 23:59 — marks absent for employees with no check-in.
 // Skips Sundays entirely (no absent record created on Sundays).
@@ -1131,20 +1274,12 @@ exports.getTodayShiftsStatus = async (req, res) => {
 // =============================================================================
 const cron = require('node-cron');
 
-// Returns true if the given date is a Sunday
-const _isSunday = (date) => date.getDay() === 0;
-
-// Returns 00:00:00.000 of the given date
-const _startOfDay = (date) => {
-  const d = new Date(date);
-  d.setHours(0, 0, 0, 0);
-  return d;
-};
+const _isSunday  = (date) => date.getDay() === 0;
+const _startOfDay = (date) => { const d = new Date(date); d.setHours(0, 0, 0, 0); return d; };
 
 const _markAbsentForDate = async (targetDate = new Date()) => {
   const result = { marked: 0, skipped: 0, errors: 0 };
 
-  // Skip Sundays — no absent marking on Sundays
   if (_isSunday(targetDate)) {
     console.log(`[AutoAbsent] ${targetDate.toDateString()} is Sunday — skipping.`);
     return result;
@@ -1157,65 +1292,74 @@ const _markAbsentForDate = async (targetDate = new Date()) => {
   console.log(`[AutoAbsent] Marking absent for: ${dayStart.toDateString()}`);
 
   try {
-    // Get all active employees
-    const employees = await Employee.find({ isActive: { $ne: false } }).select('_id');
+    const { getAllTenantModels } = require('../config/db');
+    const tenantModelsList = getAllTenantModels();
 
-    if (!employees.length) {
-      console.log('[AutoAbsent] No active employees found.');
-      return result;
-    }
+    for (const { Attendance: TAttendance, Employee: TEmployee, User: TUser, Notification: TNotification, tenantId } of tenantModelsList) {
+      try {
+        const employees = await TEmployee.find({ isActive: { $ne: false } }).select('_id');
+        if (!employees.length) continue;
 
-    // Find employees who already have any record for this day
-    // Checks both `date` field and `checkIn` field to handle night-shift
-    // crossovers where checkIn is on the previous calendar day
-    const existingRecords = await Attendance.find({
-      $or: [
-        { date:    { $gte: dayStart, $lte: dayEnd } },
-        { checkIn: { $gte: dayStart, $lte: dayEnd } }
-      ]
-    }).select('employee');
+        const existingRecords = await TAttendance.find({
+          $or: [
+            { date:    { $gte: dayStart, $lte: dayEnd } },
+            { checkIn: { $gte: dayStart, $lte: dayEnd } }
+          ]
+        }).select('employee');
 
-    const employeesWithRecord = new Set(
-      existingRecords.map(r => r.employee.toString())
-    );
+        const employeesWithRecord = new Set(existingRecords.map(r => r.employee.toString()));
 
-    // Build absent docs only for employees with no record today
-    const absentDocs = [];
-    for (const emp of employees) {
-      if (employeesWithRecord.has(emp._id.toString())) {
-        result.skipped++;
-        continue;
+        const absentDocs = [];
+        const absentEmployeeIds = [];
+
+        for (const emp of employees) {
+          if (employeesWithRecord.has(emp._id.toString())) {
+            result.skipped++;
+            continue;
+          }
+          absentDocs.push({
+            employee:      emp._id,
+            date:          dayStart,
+            checkIn:       dayStart,
+            checkOut:      dayStart,
+            workingHours:  0,
+            adjustedHours: 0,
+            status:        'absent',
+            autoMarked:    true,
+            autoMarkedAt:  new Date(),
+            absentReason:  'no-checkin'
+          });
+          absentEmployeeIds.push(emp._id);
+        }
+
+        if (!absentDocs.length) {
+          console.log('[AutoAbsent] All employees already have records — nothing to do.');
+          continue;
+        }
+
+        try {
+          const insertResult = await TAttendance.insertMany(absentDocs, { ordered: false, rawResult: true });
+          result.marked += insertResult.insertedCount ?? absentDocs.length;
+        } catch (bulkErr) {
+          result.marked += bulkErr?.result?.nInserted ?? 0;
+          result.errors += absentDocs.length - (bulkErr?.result?.nInserted ?? 0);
+          console.warn(`[AutoAbsent] Partial insert — ${result.marked} marked, ${result.errors} errored:`, bulkErr.message);
+        }
+
+        // Notify each newly-absent employee
+        for (const empId of absentEmployeeIds) {
+          await _notifyAbsent({
+            tenantId,
+            employeeId: empId,
+            reason: 'no-checkin',
+            User: TUser,
+            Notification: TNotification
+          });
+        }
+      } catch (tenantErr) {
+        console.error('[AutoAbsent] Tenant error:', tenantErr.message);
+        result.errors++;
       }
-      absentDocs.push({
-        employee:      emp._id,
-        date:          dayStart,
-        checkIn:       dayStart,   // placeholder required by schema
-        checkOut:      dayStart,   // placeholder so pre-save skips calc
-        workingHours:  0,
-        adjustedHours: 0,
-        status:        'absent',
-        autoMarked:    true,
-        autoMarkedAt:  new Date()
-      });
-    }
-
-    if (!absentDocs.length) {
-      console.log('[AutoAbsent] All employees already have records — nothing to do.');
-      return result;
-    }
-
-    // insertMany with ordered:false — partial failures don't block the rest
-    try {
-      const insertResult = await Attendance.insertMany(absentDocs, {
-        ordered:   false,
-        rawResult: true
-      });
-      result.marked = insertResult.insertedCount ?? absentDocs.length;
-    } catch (bulkErr) {
-      // BulkWriteError is thrown even on partial success with ordered:false
-      result.marked = bulkErr?.result?.nInserted ?? 0;
-      result.errors = absentDocs.length - result.marked;
-      console.warn(`[AutoAbsent] Partial insert — ${result.marked} marked, ${result.errors} errored:`, bulkErr.message);
     }
 
     console.log(`[AutoAbsent] Done — marked: ${result.marked}, skipped: ${result.skipped}, errors: ${result.errors}`);
@@ -1227,7 +1371,6 @@ const _markAbsentForDate = async (targetDate = new Date()) => {
   return result;
 };
 
-// Schedule: every day at 23:59 in IST — change timezone to match your server
 cron.schedule('59 23 * * *', async () => {
   console.log('[AutoAbsent] Cron triggered');
   try {
@@ -1235,13 +1378,13 @@ cron.schedule('59 23 * * *', async () => {
   } catch (err) {
     console.error('[AutoAbsent] Unexpected cron error:', err);
   }
-}, { timezone: 'Asia/Kolkata' }); // ← change timezone if needed
+}, { timezone: 'Asia/Kolkata' });
 
 console.log('[AutoAbsent] Cron scheduled — daily at 23:59 Asia/Kolkata');
 
-// Export for manual testing: require the controller and call _markAbsentForDate
 exports._markAbsentForDate = _markAbsentForDate;
-// =============================================================================
+exports._notifyAbsent      = _notifyAbsent;
+
 // =============================================================================
 // AUTO-CLOSE 24H CRON JOB
 // Runs every hour. If an employee checked in but didn't check out after 24 hours,
@@ -1254,34 +1397,42 @@ cron.schedule('0 * * * *', async () => {
     const tenantModelsList = getAllTenantModels();
     const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
 
-    for (const { Attendance: TAttendance } of tenantModelsList) {
+    for (const { Attendance: TAttendance, User: TUser, Notification: TNotification, tenantId } of tenantModelsList) {
       try {
-        // Find records with checkIn, no checkOut, and checkIn older than 24h
         const openSessions = await TAttendance.find({
           checkIn: { $exists: true, $ne: null, $lte: twentyFourHoursAgo },
           $or: [
             { checkOut: { $exists: false } },
             { checkOut: null }
           ],
-          status: { $ne: 'absent' } // Don't process if already marked absent
+          status: { $ne: 'absent' }
         });
 
         for (const session of openSessions) {
-          session.workingHours = 0;
+          session.workingHours  = 0;
           session.adjustedHours = 0;
-          session.status = 'absent';
-          session.autoMarked = true;
-          session.autoMarkedAt = new Date();
-          session.absentReason = 'not-checked-out-24h';
-          
-          // IMPORTANT: We intentionally leave checkOut as null. 
+          session.status        = 'absent';
+          session.autoMarked    = true;
+          session.autoMarkedAt  = new Date();
+          session.absentReason  = 'not-checked-out-24h';
+
+          // IMPORTANT: We intentionally leave checkOut as null.
           // This ensures the frontend tables only show the Check-In time.
-          
+
           await session.save();
+
+          // Notify the employee their session was auto-closed
+          await _notifyAbsent({
+            tenantId,
+            employeeId: session.employee,
+            reason: 'not-checked-out-24h',
+            User: TUser,
+            Notification: TNotification
+          });
         }
-        
+
         if (openSessions.length > 0) {
-          console.log(`[AutoClose24h] Marked ${openSessions.length} sessions as absent (open > 24h).`);
+          console.log(`[AutoClose24h] Marked ${openSessions.length} sessions as absent (open > 24h) and notified employees.`);
         }
       } catch (tenantErr) {
         console.error('[AutoClose24h] Tenant error:', tenantErr.message);
@@ -1291,4 +1442,5 @@ cron.schedule('0 * * * *', async () => {
     console.error('[AutoClose24h] Failed:', err.message);
   }
 });
+
 console.log('[AutoClose24h] Cron scheduled — hourly check for >24h open sessions');

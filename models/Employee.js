@@ -49,6 +49,11 @@ const employeeSchema = new mongoose.Schema({
     country: String,
     zipCode: String
   },
+  role: {
+  type: String,
+  enum: [ 'manager', 'team-lead', 'employee'],  
+  default: 'employee'
+},
   department: {
     type: String,
     required: [true, 'Please add a department'],

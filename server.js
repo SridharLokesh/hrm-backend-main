@@ -86,9 +86,22 @@ const startServer = async () => {
 
   app.use('/api/projects', require('./routes/projects'));
 
-  // Mount task progress routes before generic task routes to ensure
-  // more specific endpoints (like /my-updates/today) are matched first.
-  app.use('/api/tasks', require('./routes/taskProgress'));
+  // NOTE: routes/taskProgress.js is intentionally NOT mounted here anymore.
+  // It defined /progress, /:taskId/progress (GET+POST), and
+  // /my-updates/today — the exact same paths as routes/tasks.js — but its
+  // controller (taskProgressController.js) has no ownership/assignment
+  // scoping at all (only checks tenant + isActive). Because Express
+  // matches routes in mount order, having this mounted before
+  // routes/tasks.js meant EVERY request to those paths was silently
+  // handled by the unscoped version, and the properly-scoped versions in
+  // taskController.js (admin: everything, manager/team-lead: only
+  // projects they own, employee: only tasks assigned to them, via
+  // authorizeTaskAction / listProgressAdmin) never ran — regardless of
+  // role. routes/tasks.js below covers all of the same paths correctly
+  // scoped, so this duplicate router is simply removed rather than
+  // reordered. The file itself is left in the codebase in case anything
+  // else still imports its controller directly, but it is no longer
+  // wired into the app's routing.
   app.use('/api/tasks', require('./routes/tasks'));
 
   app.use('/api/notifications', require('./routes/notifications'));

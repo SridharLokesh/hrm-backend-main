@@ -1,207 +1,212 @@
-const DefaultPermission = require('../models/Permission');
-const DefaultAttendance = require('../models/Attendance');
-const DefaultEmployee = require('../models/Employee');
+const DefaultPermission   = require('../models/Permission');
+const DefaultAttendance   = require('../models/Attendance');
+const DefaultEmployee     = require('../models/Employee');
 const DefaultNotification = require('../models/Notification');
+const DefaultUser         = require('../models/User');
 const { sendNotificationToApprovers } = require('../utils/sendNotificationToAdmins');
-const DefaultUser = require('../models/User');
-const mongoose = require('mongoose');
-
-const clients = new Map(); 
-//  SSE emit
 const { emitToUserClients } = require('./notificationController');
+const mongoose = require('mongoose');
+const moment   = require('moment');
 
+// ─── Model resolver ───────────────────────────────────────────────────────────
 const resolveModel = (req, name, defaultSchema) => {
-  if (req.models && req.models[name]) return req.models[name];
-  const schema = defaultSchema && defaultSchema.schema ? defaultSchema.schema : defaultSchema;
-  if (mongoose.models && mongoose.models[name]) return mongoose.models[name];
+  if (req?.models?.[name]) return req.models[name];
+  const schema = defaultSchema?.schema ?? defaultSchema;
+  if (mongoose.models[name]) return mongoose.models[name];
   return mongoose.model(name, schema);
 };
-const moment = require('moment');
 
-// @desc    Apply for permission
-// @route   POST /api/permissions
-// @access  Private
+// ─── Notification helper ──────────────────────────────────────────────────────
+/**
+ * Sends ONE approved/rejected notification to the employee.
+ * Guards against duplicate: checks if a notification already exists for this
+ * permission entity before creating another one.
+ */
+async function notifyEmployeePermissionDecision(req, permission, status, approverType = 'admin') {
+  try {
+    const Notification = resolveModel(req, 'Notification', DefaultNotification);
+    const User         = resolveModel(req, 'User',         DefaultUser);
+
+    // ── GUARD: only send ONE notification per permission decision ─────────────
+    const alreadySent = await Notification.findOne({
+      tenant:        req.tenant._id,
+      relatedEntity: 'permission',
+      entityId:      permission._id,
+      type:          { $in: ['permission_approved', 'permission_rejected'] }
+    }).lean();
+
+    if (alreadySent) {
+      console.log(`[Permission] Notification already sent for permission ${permission._id} — skipping.`);
+      return;
+    }
+
+    const approverName = req.user?.employee?.name || req.user?.name || (approverType === 'lead' ? 'Lead' : 'Admin');
+    const permType     = permission.permissionType || 'permission';
+    const capitalType  = permType.charAt(0).toUpperCase() + permType.slice(1);
+    const dateLabel    = moment(permission.date).format('MMM D, YYYY');
+    const timeRange    = `${moment(permission.startTime).format('h:mm A')} – ${moment(permission.endTime).format('h:mm A')}`;
+    const role         = approverType === 'lead' ? 'lead' : 'admin';
+
+    const isApproved = status === 'approved';
+    const title   = isApproved ? 'Permission approved'  : 'Permission rejected';
+    const type    = isApproved ? 'permission_approved'  : 'permission_rejected';
+    const message = isApproved
+      ? `Your ${capitalType} permission on ${dateLabel} (${timeRange}) has been approved by ${role} (${approverName}).`
+      : `Your ${capitalType} permission on ${dateLabel} (${timeRange}) has been rejected by ${role} (${approverName}).`;
+
+    const employeeId = permission.employee?._id || permission.employee;
+    const user = await User.findOne({
+      employee: employeeId,
+      tenant:   req.tenant._id,
+      isActive: true
+    }).lean();
+
+    if (!user) {
+      console.warn('[Permission] No active user found for employee:', employeeId);
+      return;
+    }
+
+    const notification = await Notification.create({
+      user:          user._id,
+      employee:      employeeId,
+      tenant:        req.tenant._id,
+      type,
+      title,
+      message,
+      relatedEntity: 'permission',
+      entityId:      permission._id,
+      meta: {
+        permissionType: permType,
+        date:           permission.date,
+        startTime:      permission.startTime,
+        endTime:        permission.endTime,
+        approverName,
+        approverType,
+        status
+      },
+      isRead: false
+    });
+
+    emitToUserClients(user._id.toString(), notification);
+  } catch (err) {
+    console.error('[Permission] Employee notification failed:', err.message);
+  }
+}
+
+// ─── @desc  Apply for permission ─────────────────────────────────────────────
+// ─── @route POST /api/permissions
+// ─── @access Private
 exports.applyForPermission = async (req, res) => {
   try {
     const { permissionType, date, startTime, endTime, reason } = req.body;
 
-    console.log('Received permission data:', {
-      permissionType,
-      date,
-      startTime,
-      endTime,
-      reason,
-    });
-
-    // Validate required fields
     if (!permissionType || !date || !startTime || !endTime || !reason) {
       return res.status(400).json({
-        message:
-          'All fields are required: permissionType, date, startTime, endTime, reason',
+        message: 'All fields are required: permissionType, date, startTime, endTime, reason'
       });
     }
 
-    // Validate date is not in past
     const permissionDate = moment(date).startOf('day');
-    const today = moment().startOf('day');
+    const today          = moment().startOf('day');
 
     if (permissionDate.isBefore(today)) {
-      return res
-        .status(400)
-        .json({ message: 'Cannot apply for permission for past dates' });
+      return res.status(400).json({ message: 'Cannot apply for permission for past dates' });
     }
 
     const parseTimeWithAMPM = (timeStr, dateStr) => {
       let time = timeStr.trim().toUpperCase();
       let [timePart, modifier] = time.split(' ');
-
       let [hours, minutes] = timePart.split(':');
-      hours = parseInt(hours);
+      hours   = parseInt(hours);
       minutes = parseInt(minutes || '0');
 
-      console.log('Parsing time:', {
-        timeStr,
-        timePart,
-        modifier,
-        hours,
-        minutes,
-      });
+      if (modifier === 'PM' && hours < 12) hours += 12;
+      if (modifier === 'AM' && hours === 12) hours = 0;
 
-      // Handle AM/PM
-      if (modifier === 'PM' && hours < 12) {
-        hours += 12;
-      }
-      if (modifier === 'AM' && hours === 12) {
-        hours = 0;
-      }
-
-      // Handle 24-hour format (if no AM/PM provided)
-      if (!modifier && hours < 12 && timeStr.includes('04')) {
-        // If it's 04:00 without AM/PM, assume PM for early departure
-        hours += 12;
-      }
-
-      // Create date in IST timezone (UTC+5:30)
-      const timeString = `${dateStr}T${hours.toString().padStart(2, '0')}:${minutes
-        .toString()
-        .padStart(2, '0')}:00+05:30`;
-      
-      return moment(timeString).toDate(); // This will store as UTC but represent IST time
+      const timeString = `${dateStr}T${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:00+05:30`;
+      return moment(timeString).toDate();
     };
 
     const startDateTime = parseTimeWithAMPM(startTime, date);
-    const endDateTime = parseTimeWithAMPM(endTime, date);
+    const endDateTime   = parseTimeWithAMPM(endTime,   date);
 
-    console.log('Final parsed times:', {
-      startTime: startTime,
-      startDateTime: startDateTime.toISOString(),
-      startDateTimeLocal: startDateTime.toString(),
-      endTime: endTime,
-      endDateTime: endDateTime.toISOString(),
-      endDateTimeLocal: endDateTime.toString(),
-    });
-
-    // Validate that dates are valid
     if (!moment(startDateTime).isValid() || !moment(endDateTime).isValid()) {
       return res.status(400).json({ message: 'Invalid date or time format' });
     }
 
-    // Validate that end time is after start time
     if (moment(endDateTime).isSameOrBefore(moment(startDateTime))) {
-      return res
-        .status(400)
-        .json({ message: 'End time must be after start time' });
+      return res.status(400).json({ message: 'End time must be after start time' });
     }
 
-    // Calculate duration in hours
-    const duration = moment(endDateTime).diff(
-      moment(startDateTime),
-      'hours',
-      true
-    );
+    const duration = moment(endDateTime).diff(moment(startDateTime), 'hours', true);
 
-    console.log('Calculated duration:', duration);
-
-    // Validate duration is positive
     if (duration <= 0) {
-      return res.status(400).json({
-        message:
-          'Duration must be positive. End time should be after start time.',
-      });
+      return res.status(400).json({ message: 'Duration must be positive. End time should be after start time.' });
     }
 
-    // Check for existing permission on same date
     const PermissionModel = resolveModel(req, 'Permission', DefaultPermission);
+
     const existingPermission = await PermissionModel.findOne({
       employee: req.user.employee._id,
-      date: permissionDate.toDate(),
-      status: { $in: ['pending', 'approved'] },
+      date:     permissionDate.toDate(),
+      status:   { $in: ['pending', 'approved'] }
     });
 
     if (existingPermission) {
-      return res
-        .status(400)
-        .json({ message: 'Already have a permission request for this date' });
+      return res.status(400).json({ message: 'Already have a permission request for this date' });
     }
 
     const permission = await PermissionModel.create({
-      employee: req.user.employee._id,
+      employee:       req.user.employee._id,
       permissionType,
-      date: permissionDate.toDate(),
-      startTime: startDateTime,
-      endTime: endDateTime,
-      duration: parseFloat(duration.toFixed(2)),
-      reason,
+      date:           permissionDate.toDate(),
+      startTime:      startDateTime,
+      endTime:        endDateTime,
+      duration:       parseFloat(duration.toFixed(2)),
+      reason
     });
 
     await permission.populate('employee', 'name email department position');
 
-// 🔥 NOTIFY ADMINS + LEADS
+    // Notify admins + leads about new request
     try {
-      await sendNotificationToApprovers(req, permission, 'permission_request', 
+      await sendNotificationToApprovers(req, permission, 'permission_request',
         'New Permission Request',
         `${permission.employee.name} requested ${permission.permissionType} permission on ${moment(permission.date).format('MMM D')} (${moment(permission.startTime).format('LT')} - ${moment(permission.endTime).format('LT')})`
       );
     } catch (err) {
-      console.error('❌ Approver notification failed:', err);
+      console.error('Approver notification failed:', err);
     }
 
     res.status(201).json(permission);
-
   } catch (error) {
     console.error('Apply for permission error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 };
 
-// @desc    Get my permissions
-// @route   GET /api/permissions/my-permissions
-// @access  Private
+// ─── @desc  Get my permissions ────────────────────────────────────────────────
+// ─── @route GET /api/permissions/my-permissions
+// ─── @access Private
 exports.getMyPermissions = async (req, res) => {
   try {
     const { month, year, status } = req.query;
-    let filter = { employee: req.user.employee._id };
+    const filter = { employee: req.user.employee._id };
 
     if (month && year) {
-      // CHANGE: Use local time instead of UTC
-      const startDate = moment(`${year}-${month}`, 'YYYY-MM').startOf('month').toDate();
-      const endDate = moment(`${year}-${month}`, 'YYYY-MM').endOf('month').toDate();
-      filter.date = { $gte: startDate, $lte: endDate };
+      filter.date = {
+        $gte: moment(`${year}-${month}`, 'YYYY-MM').startOf('month').toDate(),
+        $lte: moment(`${year}-${month}`, 'YYYY-MM').endOf('month').toDate()
+      };
     }
 
-    if (status) {
-      filter.status = status;
-    }
+    if (status) filter.status = status;
 
-    const PermissionModel2 = resolveModel(req, 'Permission', DefaultPermission);
-    const permissions = await PermissionModel2.find(filter)
-          .populate({
-              path: 'approvals.approver',
-              select: 'name',
-              model: 'Employee'
-      
-          })
-          .sort({ date: -1 });
+    const PermissionModel = resolveModel(req, 'Permission', DefaultPermission);
+
+    const permissions = await PermissionModel.find(filter)
+      .populate({ path: 'approvals.approver', select: 'name', model: 'Employee' })
+      .sort({ date: -1 });
 
     res.json(permissions);
   } catch (error) {
@@ -210,40 +215,32 @@ exports.getMyPermissions = async (req, res) => {
   }
 };
 
-
-// @desc    Get all permissions (Admin/Manager)
-// @route   GET /api/permissions
-// @access  Private/Admin
+// ─── @desc  Get all permissions (Admin) ──────────────────────────────────────
+// ─── @route GET /api/permissions
+// ─── @access Private/Admin
+// Filters: ?status=pending|approved|rejected&month=MM&year=YYYY&employeeId=xxx
 exports.getAllPermissions = async (req, res) => {
   try {
     const { status, month, year, employeeId } = req.query;
-    let filter = {};
+    const filter = {};
 
-    if (status) {
-      filter.status = status;
-    }
+    if (status) filter.status = status;
 
     if (month && year) {
-      // CHANGE: Use local time instead of UTC
-      const startDate = moment(`${year}-${month}`, 'YYYY-MM').startOf('month').toDate();
-      const endDate = moment(`${year}-${month}`, 'YYYY-MM').endOf('month').toDate();
-      filter.date = { $gte: startDate, $lte: endDate };
+      filter.date = {
+        $gte: moment(`${year}-${month}`, 'YYYY-MM').startOf('month').toDate(),
+        $lte: moment(`${year}-${month}`, 'YYYY-MM').endOf('month').toDate()
+      };
     }
 
-    if (employeeId) {
-      filter.employee = employeeId;
-    }
+    if (employeeId) filter.employee = employeeId;
 
-    const PermissionModel3 = resolveModel(req, 'Permission', DefaultPermission);
-    const permissions = await PermissionModel3.find(filter)
-          .populate('employee', 'name email department position')
-          .populate({
-              path: 'approvals.approver',
-              select: 'name',
-              model: 'Employee'
-      
-          })
-          .sort({ createdAt: -1 });
+    const PermissionModel = resolveModel(req, 'Permission', DefaultPermission);
+
+    const permissions = await PermissionModel.find(filter)
+      .populate('employee', 'name email department position')
+      .populate({ path: 'approvals.approver', select: 'name', model: 'Employee' })
+      .sort({ createdAt: -1 });
 
     res.json(permissions);
   } catch (error) {
@@ -252,10 +249,10 @@ exports.getAllPermissions = async (req, res) => {
   }
 };
 
-// @desc    Update permission status
-// @route   PUT /api/permissions/:id/status
-// @access  Private/Admin
-exports.updatePermissionStatus = async (req, res) => { // Admin approval
+// ─── @desc  Update permission status — Admin ──────────────────────────────────
+// ─── @route PUT /api/permissions/:id/status
+// ─── @access Private/Admin
+exports.updatePermissionStatus = async (req, res) => {
   try {
     const { status } = req.body;
 
@@ -263,189 +260,97 @@ exports.updatePermissionStatus = async (req, res) => { // Admin approval
       return res.status(400).json({ message: 'Invalid status' });
     }
 
-    const PermissionModel4 = resolveModel(req, 'Permission', DefaultPermission);
-    const permission = await PermissionModel4.findById(req.params.id).populate('employee', 'name email department position');
+    const PermissionModel = resolveModel(req, 'Permission', DefaultPermission);
+    const permission      = await PermissionModel.findById(req.params.id)
+      .populate('employee', 'name email department position');
 
-    if (!permission) {
-      return res.status(404).json({ message: 'Permission not found' });
-    }
+    if (!permission) return res.status(404).json({ message: 'Permission not found' });
 
+    // ── FIRST ACTION WINS ─────────────────────────────────────────────────────
     if (permission.status !== 'pending') {
-      return res.status(400).json({ message: 'Can only update pending permissions' });
+      return res.status(400).json({
+        message: `Permission already ${permission.status}. First action wins — no further changes allowed.`
+      });
     }
 
-    // Add admin approval
     permission.approvals = permission.approvals || [];
-    permission.approvals.push({
-      approver: req.user.employee._id,
-      status,
-      approverType: 'admin'
-    });
+    permission.approvals.push({ approver: req.user.employee._id, status, approverType: 'admin' });
 
-    // Directly compute status: any approval = approved, any rejection = rejected
-    const hasRejection = permission.approvals.some(a => a.status === 'rejected');
-    const anyApproval = permission.approvals.some(a => a.status === 'approved');
-    if (hasRejection) {
-      permission.status = 'rejected';
-    } else if (anyApproval) {
-      permission.status = 'approved';
-    } else {
-      permission.status = 'pending';
-    }
-
+    // First action wins — set final status immediately
+    permission.status = status;
     await permission.save();
 
     await permission.populate('approvals.approver', 'name position');
 
-    // Notify employee
-    try {
-      const Notification = resolveModel(req, 'Notification', DefaultNotification);
-      const User = resolveModel(req, 'User', DefaultUser);
-
-      const user = await User.findOne({
-        employee: permission.employee._id,
-        tenant: req.tenant._id,
-        isActive: true
-      });
-
-      if (user) {
-        const notification = await Notification.create({
-          user: user._id,
-          tenant: req.tenant._id,
-          type: 'permission_status',
-          message: `Admin ${status} your permission request (${permission.status})`,
-          relatedEntity: 'permission',
-          entityId: permission._id,
-          employee: permission.employee._id,
-          title: 'Permission Update',
-          isRead: false
-        });
-
-        emitToUserClients(user._id.toString(), notification);
-      }
-    } catch (err) {
-      console.error('Admin employee notification failed:', err);
-    }
-
-    // If now approved, notify employee final status
-    if (permission.status === 'approved') {
-      try {
-        const Notification = resolveModel(req, 'Notification', DefaultNotification);
-        const User = resolveModel(req, 'User', DefaultUser);
-
-        const user = await User.findOne({
-          employee: permission.employee._id,
-          tenant: req.tenant._id,
-          isActive: true
-        });
-
-        if (user) {
-          const notification = await Notification.create({
-            user: user._id,
-            tenant: req.tenant._id,
-            type: 'permission_approved',
-            message: 'Your permission request has been fully approved!',
-            relatedEntity: 'permission',
-            entityId: permission._id,
-            employee: permission.employee._id,
-            title: 'Permission Approved',
-            isRead: false
-          });
-
-          emitToUserClients(user._id.toString(), notification);
-        }
-      } catch (err) {
-        console.error('Final permission approval notification failed:', err);
-      }
-    }
+    // Notify employee — guard inside helper prevents duplicates
+    await notifyEmployeePermissionDecision(req, permission, status, 'admin');
 
     res.json(permission);
-
   } catch (error) {
     console.error('Update admin permission status error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 };
 
-
-// @desc    Get permission statistics
-// @route   GET /api/permissions/stats
-// @access  Private
+// ─── @desc  Get permission statistics ────────────────────────────────────────
+// ─── @route GET /api/permissions/stats
+// ─── @access Private
 exports.getPermissionStats = async (req, res) => {
   try {
-    const currentYear = moment().year();
+    const currentYear     = moment().year();
+    const PermissionModel = resolveModel(req, 'Permission', DefaultPermission);
 
-    const PermissionModel5 = resolveModel(req, 'Permission', DefaultPermission);
-    const stats = await PermissionModel5.aggregate([
+    const stats = await PermissionModel.aggregate([
       {
         $match: {
           employee: req.user.employee._id,
           date: {
             $gte: new Date(`${currentYear}-01-01`),
-            $lte: new Date(`${currentYear}-12-31`),
-          },
-        },
+            $lte: new Date(`${currentYear}-12-31`)
+          }
+        }
       },
-      {
-        $group: {
-          _id: '$status',
-          count: { $sum: 1 },
-          totalHours: { $sum: '$duration' },
-        },
-      },
+      { $group: { _id: '$status', count: { $sum: 1 }, totalHours: { $sum: '$duration' } } }
     ]);
 
-    // Get monthly breakdown
-
-  const monthlyStats = await PermissionModel5.aggregate([
+    const monthlyStats = await PermissionModel.aggregate([
       {
         $match: {
           employee: req.user.employee._id,
           date: {
             $gte: new Date(`${currentYear}-01-01`),
-            $lte: new Date(`${currentYear}-12-31`),
-          },
-        },
+            $lte: new Date(`${currentYear}-12-31`)
+          }
+        }
       },
       {
         $group: {
-          _id: {
-            month: { $month: '$date' },
-            status: '$status',
-          },
-          count: { $sum: 1 },
-        },
+          _id:   { month: { $month: '$date' }, status: '$status' },
+          count: { $sum: 1 }
+        }
       },
-      {
-        $sort: { '_id.month': 1 },
-      },
+      { $sort: { '_id.month': 1 } }
     ]);
 
-    res.json({
-      yearlyStats: stats,
-      monthlyStats: monthlyStats,
-    });
+    res.json({ yearlyStats: stats, monthlyStats });
   } catch (error) {
     console.error('Get permission stats error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 };
 
-// NEW: Lead gets ALL pending permissions (global)
+// ─── @desc  Lead: get ALL permissions (all statuses) ─────────────────────────
+// ─── @route GET /api/permissions/lead/pending
+// ─── @access Private/Lead
 exports.getAllPendingPermissionsForLead = async (req, res) => {
   try {
     const { status = 'pending' } = req.query;
-    const PermissionModel = resolveModel(req, 'Permission', DefaultPermission);
+    const PermissionModel        = resolveModel(req, 'Permission', DefaultPermission);
 
     const permissions = await PermissionModel.find({ status })
-          .populate('employee', 'name email department position')
-          .populate({
-              path: 'approvals.approver',
-              select: 'name position',
-              model: 'Employee'
-      
-          })
-          .sort({ createdAt: -1 });
+      .populate('employee', 'name email department position')
+      .populate({ path: 'approvals.approver', select: 'name position', model: 'Employee' })
+      .sort({ createdAt: -1 });
 
     res.json(permissions);
   } catch (error) {
@@ -454,8 +359,10 @@ exports.getAllPendingPermissionsForLead = async (req, res) => {
   }
 };
 
-// NEW: Lead update status for ANY permission
-exports.updateLeadPermissionStatus = async (req, res) => { // Dual approval
+// ─── @desc  Lead: update status for ANY permission ───────────────────────────
+// ─── @route PUT /api/permissions/:id/lead-status
+// ─── @access Private/Lead
+exports.updateLeadPermissionStatus = async (req, res) => {
   try {
     const { status } = req.body;
 
@@ -464,111 +371,37 @@ exports.updateLeadPermissionStatus = async (req, res) => { // Dual approval
     }
 
     const PermissionModel = resolveModel(req, 'Permission', DefaultPermission);
-    const permission = await PermissionModel.findById(req.params.id).populate('employee');
+    const permission      = await PermissionModel.findById(req.params.id).populate('employee');
 
-    if (!permission) {
-      return res.status(404).json({ message: 'Permission not found' });
-    }
+    if (!permission) return res.status(404).json({ message: 'Permission not found' });
 
+    // ── FIRST ACTION WINS ─────────────────────────────────────────────────────
     if (permission.status !== 'pending') {
-      return res.status(400).json({ message: 'Can only update pending permissions' });
+      return res.status(400).json({
+        message: `Permission already ${permission.status}. First action wins — no further changes allowed.`
+      });
     }
 
-    // Prevent duplicate lead approval
+    // Prevent same lead from acting twice
     const existingLeadApproval = permission.approvals.find(
       a => a.approverType === 'lead' && a.approver.toString() === req.user.employee._id.toString()
     );
     if (existingLeadApproval) {
-      return res.status(400).json({ message: 'Already approved by this lead' });
+      return res.status(400).json({ message: 'You have already acted on this permission' });
     }
 
-    // Add lead approval
     permission.approvals = permission.approvals || [];
-    permission.approvals.push({
-      approver: req.user.employee._id,
-      status,
-      approverType: 'lead'
-    });
+    permission.approvals.push({ approver: req.user.employee._id, status, approverType: 'lead' });
 
-    // Directly compute status: any approval = approved, any rejection = rejected
-    const hasRejectionL = permission.approvals.some(a => a.status === 'rejected');
-    const anyApprovalL = permission.approvals.some(a => a.status === 'approved');
-    if (hasRejectionL) {
-      permission.status = 'rejected';
-    } else if (anyApprovalL) {
-      permission.status = 'approved';
-    } else {
-      permission.status = 'pending';
-    }
-
+    // First action wins — set final status immediately
+    permission.status = status;
     await permission.save();
 
     await permission.populate('approvals.approver', 'name position');
     await permission.populate('employee', 'name email department');
 
-    // Employee notification
-    try {
-      const Notification = resolveModel(req, 'Notification', DefaultNotification);
-      const User = resolveModel(req, 'User', DefaultUser);
-      const employeeUser = await User.findOne({ employee: permission.employee._id, tenant: req.tenant._id });
-      if (employeeUser) {
-        await Notification.create({
-          user: employeeUser._id,
-          employee: permission.employee._id,
-          title: 'Permission Update',
-          message: `Lead ${status} your permission request (Status: ${permission.status})`,
-          type: 'permission_status',
-          tenant: req.tenant._id,
-          relatedEntity: 'permission',
-          entityId: permission._id,
-          isRead: false
-        });
-      }
-    } catch (err) {
-      console.error('Employee notification failed:', err);
-    }
-
-    // Admin notification  
-    try {
-      const User = resolveModel(req, 'User', DefaultUser);
-      const adminUsers = await User.find({ role: 'admin', tenant: req.tenant._id, isActive: true });
-      const Notification = resolveModel(req, 'Notification', DefaultNotification);
-      for (const adminUser of adminUsers) {
-        await Notification.create({
-          user: adminUser._id,
-          employee: permission.employee._id,
-          title: 'Lead Permission Decision',
-          message: `Lead ${status} ${permission.employee.name}'s ${permission.permissionType} (${permission.status})`,
-          type: 'general',
-          tenant: req.tenant._id,
-          relatedEntity: 'permission',
-          entityId: permission._id,
-          isRead: false
-        });
-      }
-    } catch (err) {
-      console.error('Admin notification failed:', err);
-    }
-
-    // If now approved (both), notify employee final status
-    if (permission.status === 'approved') {
-      try {
-        const Notification = resolveModel(req, 'Notification', DefaultNotification);
-        await Notification.create({
-          user: permission.employee._id,
-          tenant: req.tenant?._id,
-          type: 'permission_approved',
-          message: 'Your permission request has been fully approved!',
-          relatedEntity: 'permission',
-          entityId: permission._id,
-          employee: permission.employee._id,
-          title: 'Permission Approved',
-          isRead: false
-        });
-      } catch (err) {
-        console.error('Final permission approval notification failed:', err);
-      }
-    }
+    // Notify employee — guard inside helper prevents duplicates
+    await notifyEmployeePermissionDecision(req, permission, status, 'lead');
 
     res.json(permission);
   } catch (error) {
@@ -577,25 +410,22 @@ exports.updateLeadPermissionStatus = async (req, res) => { // Dual approval
   }
 };
 
-
-// Helper function (DISABLED - manual checkin required)
-// const updateAttendanceWithPermission = async (req, permission) => { ... };
-
-// @desc    Fix stale permission records (status='pending' but has approvals)
-// @route   POST /api/permissions/fix-stale
-// @access  Private/Admin
+// ─── @desc  Fix stale permission records ─────────────────────────────────────
+// ─── @route POST /api/permissions/fix-stale
+// ─── @access Private/Admin
 exports.fixStalePermissions = async (req, res) => {
   try {
     const PermissionModel = resolveModel(req, 'Permission', DefaultPermission);
-    // Find all 'pending' records that actually have an approval entry
-    const stale = await PermissionModel.find({ status: 'pending', 'approvals.0': { $exists: true } });
+    const stale           = await PermissionModel.find({ status: 'pending', 'approvals.0': { $exists: true } });
+
     let fixed = 0;
     for (const perm of stale) {
       const hasRejection = perm.approvals.some(a => a.status === 'rejected');
-      const anyApproval = perm.approvals.some(a => a.status === 'approved');
-      if (hasRejection) { perm.status = 'rejected'; await perm.save(); fixed++; }
+      const anyApproval  = perm.approvals.some(a => a.status === 'approved');
+      if (hasRejection)     { perm.status = 'rejected'; await perm.save(); fixed++; }
       else if (anyApproval) { perm.status = 'approved'; await perm.save(); fixed++; }
     }
+
     res.json({ message: `Fixed ${fixed} of ${stale.length} stale permission records.` });
   } catch (error) {
     console.error('Fix stale permissions error:', error);

@@ -4,18 +4,17 @@ const {
   markAsRead,
   markAllAsRead,
   getUnreadCount,
-  streamNotifications,
+  deleteNotification,   // ← add this export to notificationController
 } = require('../controllers/notificationController');
-const { protect } = require('../middleware/auth');
+const { protect }       = require('../middleware/auth');
 const { requireTenant } = require('../middleware/tenant');
-// sseAuth removed
 
 const router = express.Router();
 
 router.use(protect);
 
 router.route('/')
- .get(getNotifications);
+  .get(getNotifications);
 
 router.route('/read-all')
   .put(markAllAsRead);
@@ -23,9 +22,11 @@ router.route('/read-all')
 router.route('/unread-count')
   .get(getUnreadCount);
 
-// /stream route removed
-
 router.route('/:id/read')
   .put(markAsRead);
+
+// ← NEW: delete a single notification
+router.route('/:id')
+  .delete(deleteNotification);
 
 module.exports = router;
